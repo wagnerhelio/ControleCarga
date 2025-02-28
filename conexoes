@@ -1,0 +1,5 @@
+LET SQLGitLab = 'SQLGitLab';
+LET ETL = 'ETL';
+LET ETLDesktop = 'ETLDesktop';
+LET HistoricoControleCarga = 'HistoricoControleCarga';
+LET vServer = ComputerName();
