@@ -1,0 +1,78 @@
+IF '$(vServer)' = 'PAINEIS' THEN 
+    Let vFimCarga = Timestamp(Now(), 'DD/MM/YYYY hh:mm:ss');
+    Let vTotalCarga = Interval(Timestamp#('$(vFimCarga)', 'DD/MM/YYYY hh:mm:ss') - Timestamp#('$(vInicioCarga)', 'DD/MM/YYYY hh:mm:ss'), 'hh:mm:ss');
+    
+    SET MaxRetries = 300;        // Define o número máximo de tentativas
+    SET RetryCount = 0;         // Inicializa o contador de tentativas
+    SET RetryDelay = 30 * 60;   // Define o intervalo de espera entre tentativas (30 minutos em segundos)
+    SET RetrySuccess = 0;       // Inicializa o status de sucesso como 0
+    SET ErrorMode = 0;          // Configura para evitar a interrupção automática em caso de erro
+    DO
+        TRACE Tentativa $(RetryCount) de $(MaxRetries)...;   
+
+        LET vAllCompleted = 1; // Assume inicialmente que todos estão concluídos
+        FOR i = 0 TO $(vTotalArquivos_SQL) - 1
+            DROP TABLE ControleProcessamento;
+            ControleProcessamento:
+            LOAD * FROM [lib://SQLGitLab/ControleProcessamento.qvd](qvd);
+
+            LET vID_PrioridadeFinal = Peek('ID_Prioridade', $(i), 'ControleProcessamento');
+            LET vArquivo_NormalizadoFinal = Peek('Arquivo_Normalizado', $(i), 'ControleProcessamento');
+            LET vStatus_ArquivoFinal = Peek('Status_Arquivo', $(i), 'ControleProcessamento');
+            LET vStatus_PastaFinal = Peek('Status_Pasta', $(i), 'ControleProcessamento');
+
+            IF '$(vStatus_ArquivoFinal)' <> 'Concluido' OR '$(vStatus_PastaFinal)' <> 'Em_Andamento' THEN
+                LET vAllCompleted = 0; // Identificado que a condição não é satisfeita
+                EXIT FOR;
+            ENDIF 
+        NEXT
+
+        // Atualização do controle do loop
+        IF vAllCompleted = 1 THEN
+            LET RetrySuccess = 1; // Condição atendida, sair do loop
+            TRACE Todos os arquivos foram processados com sucesso na tentativa $(RetryCount).;
+        ELSE
+            LET RetryCount = $(RetryCount) + 1;
+            TRACE Arquivos pendentes. Tentativa $(RetryCount) falhou. Tentando novamente em $(RetryDelay) segundos...;
+            Sleep $(RetryDelay) * 1000;
+        ENDIF
+
+    LOOP WHILE $(RetrySuccess) = 0 AND $(RetryCount) < $(MaxRetries)
+
+    // Se não conseguir processar os arquivos após todas as tentativas
+    IF $(RetrySuccess) = 0 THEN
+        TRACE Não foi possível processar todos os arquivos após $(MaxRetries) tentativas. Verifique o sistema.;
+        EXIT SCRIPT;
+    ENDIF
+
+    SET ErrorMode = 1;
+
+    DROP TABLE ControleProcessamento;
+    ControleProcessamento:
+        LOAD
+          Arquivo_Normalizado,
+          Pasta_Raiz_SQL,
+          Pasta_SQL,
+          ID_Prioridade,
+          Pasta_DataBase_SQL,
+          Conexao_SQL,
+          Servidor_Responsavel,
+          Arquivo_SQL,
+          CaminhoCompleto_SQL,
+          TotalArquivoPasta_SQL,
+          TotalArquivos_SQL,
+          Size_QVD,
+          Server,
+          Status_Arquivo,
+          IF(Status_Pasta = 'Em_Andamento', 'Concluido', Status_Pasta) AS Status_Pasta,
+          InicioCarga,
+          InicioETL,
+          FimETL,
+          TotalETL,
+          NumeroLinhas,
+          '$(vFimCarga)' AS FimCarga, 
+          '$(vTotalCarga)' AS TotalCarga 
+    FROM [lib://$(SQLGitLab)/ControleProcessamento.qvd] (qvd);
+    STORE ControleProcessamento INTO [lib://$(SQLGitLab)/ControleProcessamento.qvd] (qvd);
+    DROP TABLE ControleProcessamento; 
+ENDIF
