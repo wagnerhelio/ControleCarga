@@ -1,0 +1,770 @@
+LET SQLGitLab = 'SQLGitLab';
+LET ETL = 'ETL';
+LET ETLDesktop = 'ETLDesktop';
+LET HistoricoControleCarga = 'HistoricoControleCarga';
+LET vServer = ComputerName();
+SUB RecursiveFileSearch(vPastaAtual)
+    FOR EACH vFile IN FileList('$(vPastaAtual)/*.sql')
+        ListaSQL:
+        LOAD
+            RowNo() AS ID_SQL,
+            SubField('$(vFile)', '/', 3) AS Pasta_Raiz_SQL, 
+            SubField('$(vFile)', '/', 4) AS Pasta_DataBase_SQL,              
+            IF(
+                WildMatch(SubField('$(vFile)', '/', 4), '*-oracle*'),'ORACLE - REPLICA',
+                IF(
+                    WildMatch(SubField('$(vFile)', '/', 4), '*-mongodb*'),'MongoDB - PROD',
+                    IF(
+                        WildMatch(SubField('$(vFile)', '/', 4), '*-sqlserver*'),'SQL Server - PROD',
+                        IF(
+                            WildMatch(SubField('$(vFile)', '/', 4), '*-mysql*') AND SubField('$(vFile)', '/', 5) = 'extract_dgap_mysql','MySQL - SGP PROD',
+                            IF(
+                                WildMatch(SubField('$(vFile)', '/', 4), '*-mysql*') AND SubField('$(vFile)', '/', 5) = 'extract_maria_penha_mysql','MySQL - MARIAPENHA PROD',
+                                IF(
+                                    WildMatch(SubField('$(vFile)', '/', 4), '*-postgresql*') AND SubField('$(vFile)', '/', 5) = 'extract_ccdpm_postgresql','PostgreSQL - PMGO PROD',
+                                    IF(
+                                        WildMatch(SubField('$(vFile)', '/', 4), '*-postgresql*') AND SubField('$(vFile)', '/', 5) = 'extract_redmine_postgresql','PostgreSQL - REDMINE PROD',
+                                        'CONEXÃO INVALIDA'
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            ) AS Conexao_SQL,
+            IF(
+                WildMatch(SubField('$(vFile)', '/', 4), '*-mongodb*'), 'PAINEIS', // Se for MongoDB, sempre PAINEIS
+                IF(Mod(RowNo(),2) = 0, 'ESTATISTICA', 'PAINEIS') 
+            ) AS Servidor_Responsavel,
+            SubField('$(vFile)', '/', 5) AS Pasta_SQL,
+            SubField('$(vFile)', '/', 6) AS Arquivo_SQL,
+            Replace(SubField('$(vFile)', '/', 6), '.sql', '') AS Arquivo_Normalizado,
+            '$(vFile)' AS CaminhoCompleto_SQL
+        AUTOGENERATE 1;
+        LET vTotalLinhas = NoOfRows('ListaSQL');
+    NEXT
+    
+    FOR EACH vFile IN FileList('$(vPastaAtual)/*.qvd')
+    LET vFileSize = FileSize('$(vFile)');
+        ListaQVD:
+        LOAD
+            Replace(SubField('$(vFile)', '/', 6), '.qvd', '') AS Arquivo_Normalizado,
+            $(vFileSize) AS Size_QVD
+        AUTOGENERATE 1;
+        LET vTotalLinhas = NoOfRows('ListaQVD');
+    NEXT
+    
+
+    FOR EACH vSubPasta IN DirList('$(vPastaAtual)/*')
+        IF NOT WildMatch(vSubPasta, '*extract_diversos_ofc*') THEN
+            CALL RecursiveFileSearch('$(vSubPasta)'); 
+        ENDIF
+    NEXT
+END SUB
+
+CALL RecursiveFileSearch('lib://$(SQLGitLab)');
+CALL RecursiveFileSearch('lib://$(ETL)');
+
+TotalPasta_SQL:
+INNER JOIN (ListaSQL)
+LOAD DISTINCT
+Pasta_SQL,
+COUNT(ID_SQL) AS TotalArquivoPasta_SQL
+RESIDENT ListaSQL GROUP BY Pasta_SQL;
+
+TotalArquivos_SQL:
+INNER JOIN (ListaSQL)
+LOAD DISTINCT
+Pasta_Raiz_SQL,
+COUNT(ID_SQL) AS TotalArquivos_SQL
+RESIDENT ListaSQL GROUP BY Pasta_Raiz_SQL;
+
+ListaQVD:
+INNER JOIN (ListaSQL)
+LOAD DISTINCT * RESIDENT ListaQVD;
+DROP TABLE ListaQVD;
+
+PrioridadeSQL:
+LOAD 
+  RowNo() AS ID_Prioridade,
+  *
+RESIDENT ListaSQL ORDER BY Size_QVD DESC;
+DROP TABLE ListaSQL;
+
+//STORE ListaSQL INTO [lib://$(SQLGitLab)/ListaArquivos.qvd] (qvd);
+
+Let vInicioCarga = Timestamp(Now(), 'DD/MM/YYYY hh:mm:ss');
+
+IF (FileSize('lib://$(SQLGitLab)/ControleProcessamento.qvd') > 0) THEN
+    // Carrega os dados existentes
+    ControleProcessamento:
+    LOAD
+      Arquivo_Normalizado,
+      Pasta_Raiz_SQL,
+      Pasta_SQL,
+      ID_Prioridade,
+      Pasta_DataBase_SQL,
+      Conexao_SQL,
+      Servidor_Responsavel,
+      Arquivo_SQL,
+      CaminhoCompleto_SQL,
+      TotalArquivoPasta_SQL,
+      TotalArquivos_SQL,
+      Size_QVD,
+      Server,
+      Status_Arquivo,
+      Status_Pasta,
+      InicioCarga,
+      InicioETL,
+      FimETL,
+      TotalETL,
+      NumeroLinhas,
+      FimCarga,
+      TotalCarga
+    FROM [lib://SQLGitLab/ControleProcessamento.qvd](qvd);
+    
+    LET vAllCompleted = 1;
+    FOR i = 0 TO NoOfRows('ControleProcessamento') - 1
+        LET vStatus_ArquivoFinal = Peek('Status_Arquivo', $(i), 'ControleProcessamento');
+        LET vStatus_PastaFinal = Peek('Status_Pasta', $(i), 'ControleProcessamento');
+        
+        IF '$(vStatus_ArquivoFinal)' <> 'Concluido' OR '$(vStatus_PastaFinal)' <> 'Concluido' THEN
+            LET vAllCompleted = 0;
+            EXIT FOR;
+        ENDIF 
+    NEXT
+
+    IF $(vAllCompleted) = 1 THEN
+        TRACE Todos os arquivos foram processados. Criando nova carga....;
+        DROP TABLE ControleProcessamento;
+        ControleProcessamento:
+        LOAD
+            Arquivo_Normalizado,
+            Pasta_Raiz_SQL,
+            Pasta_SQL,
+            ID_Prioridade,
+            Pasta_DataBase_SQL,
+            Conexao_SQL,
+            Servidor_Responsavel,
+            Arquivo_SQL,
+            CaminhoCompleto_SQL,
+            TotalArquivoPasta_SQL,
+            TotalArquivos_SQL,
+            Size_QVD,
+            'Nao_Iniciado' AS Server,
+            'Nao_Iniciado' AS Status_Arquivo,
+            'Nao_Iniciado' AS Status_Pasta,
+            '$(vInicioCarga)' AS InicioCarga,
+            ''  AS InicioETL,
+            ''  AS FimETL,
+            ''  AS TotalETL,
+            ''  AS NumeroLinhas,
+            ''  AS FimCarga,
+            ''  AS TotalCarga
+        Resident PrioridadeSQL;
+    ELSE
+        TRACE Ainda há arquivos em processamento.;
+    ENDIF
+ELSE
+    TRACE Arquivo não encontrado. Criando nova tabela...;
+    ControleProcessamento:
+    LOAD
+      Arquivo_Normalizado,
+      Pasta_Raiz_SQL,
+      Pasta_SQL,
+      ID_Prioridade,
+      Pasta_DataBase_SQL,
+      Conexao_SQL,
+      Servidor_Responsavel,
+      Arquivo_SQL,
+      CaminhoCompleto_SQL,
+      TotalArquivoPasta_SQL,
+      TotalArquivos_SQL,
+      Size_QVD,
+      'Nao_Iniciado' AS Server,
+      'Nao_Iniciado' AS Status_Arquivo,
+      'Nao_Iniciado' AS Status_Pasta,
+      '$(vInicioCarga)' AS InicioCarga,
+      ''  AS InicioETL,
+      ''  AS FimETL,
+      ''  AS TotalETL,
+      ''  AS NumeroLinhas,
+      ''  AS FimCarga,
+      ''  AS TotalCarga
+    Resident PrioridadeSQL;
+ENDIF
+
+// Processo de salvamento e tentativas de gravação
+SET MaxRetries = 10;        
+SET RetryCount = 0;         
+SET RetryDelay = 30 * 60;   
+SET RetrySuccess = 0;       
+SET ErrorMode = 0;          
+
+DO
+    TRACE Tentativa $(RetryCount) de $(MaxRetries)...;   
+    STORE ControleProcessamento INTO [lib://$(SQLGitLab)/ControleProcessamento.qvd] (qvd);
+    IF ScriptError = 0 THEN
+        LET RetrySuccess = 1;
+        TRACE Arquivo gravado com sucesso na tentativa $(RetryCount).;
+    ELSE
+        LET RetryCount = $(RetryCount) + 1;
+        TRACE Erro ao gravar o arquivo. Código do erro: $(ScriptError). Tentativa $(RetryCount) falhou. Tentando novamente em $(RetryDelay) segundos...;        
+        Sleep $(RetryDelay) * 1000;
+    ENDIF
+LOOP WHILE $(RetrySuccess) = 0 AND $(RetryCount) < $(MaxRetries)
+
+IF $(RetrySuccess) = 0 THEN
+    TRACE Não foi possível gravar o arquivo após $(MaxRetries) tentativas. Verifique o sistema.;
+    TRACE Lista de erros registrados: $(ScriptErrorList);
+    EXIT SCRIPT;
+ENDIF
+SET ErrorMode = 1;
+DROP TABLE PrioridadeSQL;
+
+LET vTotalArquivos_SQL = Peek('TotalArquivos_SQL', 0, 'ControleProcessamento');
+TRACE $(vTotalArquivos_SQL);
+FOR i = 0 TO $(vTotalArquivos_SQL) - 1
+          LET vArquivo_Normalizado = Peek('Arquivo_Normalizado', $(i), 'ControleProcessamento');
+          LET vPasta_Raiz_SQL = Peek('Pasta_Raiz_SQL', $(i), 'ControleProcessamento');
+          LET vPasta_SQL = Peek('Pasta_SQL', $(i), 'ControleProcessamento');
+          LET vID_Prioridade = Peek('ID_Prioridade', $(i), 'ControleProcessamento');
+          LET vPasta_DataBase_SQL = Peek('Pasta_DataBase_SQL', $(i), 'ControleProcessamento');
+          LET vConexao_SQL = Peek('Conexao_SQL', $(i), 'ControleProcessamento');
+          LET vServidor_Responsavel = Peek('Servidor_Responsavel', $(i), 'ControleProcessamento');
+          LET vArquivo_SQL = Peek('Arquivo_SQL', $(i), 'ControleProcessamento');
+          LET vCaminhoCompleto_SQL = Peek('CaminhoCompleto_SQL', $(i), 'ControleProcessamento');
+          LET vTotalArquivoPasta_SQL = Peek('TotalArquivoPasta_SQL', $(i), 'ControleProcessamento');
+          LET vSize_QVD = Peek('Size_QVD', $(i), 'ControleProcessamento');
+          LET vServerAtual = Peek('Server', $(i), 'ControleProcessamento');
+          LET vStatus_Arquivo = Peek('Status_Arquivo', $(i), 'ControleProcessamento');
+          LET vStatus_Pasta = Peek('Status_Pasta', $(i), 'ControleProcessamento');
+          LET vInicioCarga = Peek('InicioCarga', $(i), 'ControleProcessamento');
+
+    IF '$(vStatus_Pasta)'= 'Concluido' OR '$(vStatus_Arquivo)' = 'Concluido' THEN
+    	 Trace $(vID_Prioridade) | $(vPasta_SQL) | $(vArquivo_Normalizado) Concluido pelo $(vServerAtual) as $(vInicioCarga) ;
+    ELSE     
+        IF '$(vServer)'<>'$(vServidor_Responsavel)' THEN
+          Trace $(vID_Prioridade) | $(vPasta_SQL) | $(vArquivo_Normalizado) Server Responsavel $(vServidor_Responsavel) ;
+        ELSE 
+        	IF '$(vStatus_Arquivo)' = 'Em_Andamento' AND '$(vServer)'<>'$(vServidor_Responsavel)'THEN
+           		Trace $(vID_Prioridade) | $(vPasta_SQL) | $(vArquivo_Normalizado) | $(vStatus_Arquivo) ;
+            ELSE
+				DROP TABLE ControleProcessamento;
+                ControleProcessamento_Menor:
+                LOAD
+                  Arquivo_Normalizado,
+                  Pasta_Raiz_SQL,
+                  Pasta_SQL,
+                  ID_Prioridade,
+                  Pasta_DataBase_SQL,
+                  Conexao_SQL,
+                  Servidor_Responsavel,
+                  Arquivo_SQL,
+                  CaminhoCompleto_SQL,
+                  TotalArquivoPasta_SQL,
+                  TotalArquivos_SQL,
+                  Size_QVD,
+                  Server,
+                  Status_Arquivo,
+                  Status_Pasta,
+                  InicioCarga,
+                  InicioETL,
+                  FimETL,
+                  TotalETL,
+                  NumeroLinhas,
+                  FimCarga,
+                  TotalCarga
+                FROM [lib://$(SQLGitLab)/ControleProcessamento.qvd] (qvd) WHERE ID_Prioridade < '$(vID_Prioridade)';
+                SET MaxRetries = 10;        // Define o número máximo de tentativas
+                SET RetryCount = 0;         // Inicializa o contador de tentativas
+                SET RetryDelay = 30 * 60;   // Define o intervalo de espera entre tentativas (30 minutos em segundos)
+                SET RetrySuccess = 0;       // Inicializa o status de sucesso como 0
+                SET ErrorMode = 0;          // Configura para evitar a interrupção automática em caso de erro
+
+                DO
+                    TRACE Tentativa $(RetryCount) de $(MaxRetries)...;   
+                    STORE ControleProcessamento_Menor INTO [lib://$(SQLGitLab)/ControleProcessamento_Menor.qvd] (qvd);
+                    IF ScriptError = 0 THEN
+                        LET RetrySuccess = 1; // Indica sucesso se a gravação foi bem-sucedida
+                        TRACE Arquivo gravado com sucesso na tentativa $(RetryCount).;
+                    ELSE
+                        LET RetryCount = $(RetryCount) + 1;
+                        TRACE Erro ao gravar o arquivo. Código do erro: $(ScriptError). Tentativa $(RetryCount) falhou. Tentando novamente em $(RetryDelay) segundos...;        
+                        Sleep $(RetryDelay) * 1000;
+                    ENDIF
+                LOOP WHILE $(RetrySuccess) = 0 AND $(RetryCount) < $(MaxRetries)
+
+                IF $(RetrySuccess) = 0 THEN
+                    TRACE Não foi possível gravar o arquivo após $(MaxRetries) tentativas. Verifique o sistema.;
+                    TRACE Lista de erros registrados: $(ScriptErrorList);
+                    EXIT SCRIPT;
+                ENDIF
+                SET ErrorMode = 1;
+                DROP TABLE ControleProcessamento_Menor;
+                
+                ControleProcessamento_Maior:
+                LOAD
+                  Arquivo_Normalizado,
+                  Pasta_Raiz_SQL,
+                  Pasta_SQL,
+                  ID_Prioridade,
+                  Pasta_DataBase_SQL,
+                  Conexao_SQL,
+                  Servidor_Responsavel,
+                  Arquivo_SQL,
+                  CaminhoCompleto_SQL,
+                  TotalArquivoPasta_SQL,
+                  TotalArquivos_SQL,
+                  Size_QVD,
+                  Server,
+                  Status_Arquivo,
+                  Status_Pasta,
+                  InicioCarga,
+                  InicioETL,
+                  FimETL,
+                  TotalETL,
+                  NumeroLinhas,
+                  FimCarga,
+                  TotalCarga
+                FROM [lib://$(SQLGitLab)/ControleProcessamento.qvd] (qvd) WHERE ID_Prioridade > '$(vID_Prioridade)';
+                SET MaxRetries = 10;        // Define o número máximo de tentativas
+                SET RetryCount = 0;         // Inicializa o contador de tentativas
+                SET RetryDelay = 30 * 60;   // Define o intervalo de espera entre tentativas (30 minutos em segundos)
+                SET RetrySuccess = 0;       // Inicializa o status de sucesso como 0
+                SET ErrorMode = 0;          // Configura para evitar a interrupção automática em caso de erro
+
+                DO
+                    TRACE Tentativa $(RetryCount) de $(MaxRetries)...;   
+                    STORE ControleProcessamento_Maior INTO [lib://$(SQLGitLab)/ControleProcessamento_Maior.qvd] (qvd);
+                    IF ScriptError = 0 THEN
+                        LET RetrySuccess = 1; // Indica sucesso se a gravação foi bem-sucedida
+                        TRACE Arquivo gravado com sucesso na tentativa $(RetryCount).;
+                    ELSE
+                        LET RetryCount = $(RetryCount) + 1;
+                        TRACE Erro ao gravar o arquivo. Código do erro: $(ScriptError). Tentativa $(RetryCount) falhou. Tentando novamente em $(RetryDelay) segundos...;        
+                        Sleep $(RetryDelay) * 1000;
+                    ENDIF
+                LOOP WHILE $(RetrySuccess) = 0 AND $(RetryCount) < $(MaxRetries)
+
+                IF $(RetrySuccess) = 0 THEN
+                    TRACE Não foi possível gravar o arquivo após $(MaxRetries) tentativas. Verifique o sistema.;
+                    TRACE Lista de erros registrados: $(ScriptErrorList);
+                    EXIT SCRIPT;
+                ENDIF
+                SET ErrorMode = 1;
+				DROP TABLE ControleProcessamento_Maior;
+                
+                Let vInicioETL_NovoRegistro = Timestamp(Now(), 'DD/MM/YYYY hh:mm:ss');
+                
+				ControleProcessamento_NovoRegistro:
+                LOAD
+                    '$(vArquivo_Normalizado)' 	 AS Arquivo_Normalizado,
+                    '$(vPasta_Raiz_SQL)'      	 AS Pasta_Raiz_SQL,
+                    '$(vPasta_SQL)'           	 AS Pasta_SQL,
+                    '$(vID_Prioridade)'          AS ID_Prioridade,
+                    '$(vPasta_DataBase_SQL)'  	 AS Pasta_DataBase_SQL,
+                    '$(vConexao_SQL)' 		  	 AS Conexao_SQL,
+                    '$(vServidor_Responsavel)' 	 AS Servidor_Responsavel,
+                    '$(vArquivo_SQL)'         	 AS Arquivo_SQL,
+                    '$(vCaminhoCompleto_SQL)' 	 AS CaminhoCompleto_SQL,
+                    '$(vTotalArquivoPasta_SQL)'  AS TotalArquivoPasta_SQL,
+                    '$(vTotalArquivos_SQL)'   	 AS TotalArquivos_SQL,
+                    '$(vSize_QVD)'   		  	 AS Size_QVD,
+                    '$(vServer)'              	 AS Server,
+                    'Em_Andamento'            	 AS Status_Arquivo,
+                    'Em_Andamento'            	 AS Status_Pasta,
+                    '$(vInicioCarga)'         	 AS InicioCarga,
+                    '$(vInicioETL_NovoRegistro)' AS InicioETL,
+                    '0'                   	  	 AS FimETL,
+                    '0'                   	  	 AS TotalETL,
+                    '0'               		  	 AS NumeroLinhas,
+                    '0' 					  	 AS FimCarga,
+      				'0' 					  	 AS TotalCarga                
+                AUTOGENERATE 1;
+                SET MaxRetries = 10;        // Define o número máximo de tentativas
+                SET RetryCount = 0;         // Inicializa o contador de tentativas
+                SET RetryDelay = 30 * 60;   // Define o intervalo de espera entre tentativas (30 minutos em segundos)
+                SET RetrySuccess = 0;       // Inicializa o status de sucesso como 0
+                SET ErrorMode = 0;          // Configura para evitar a interrupção automática em caso de erro
+
+                DO
+                    TRACE Tentativa $(RetryCount) de $(MaxRetries)...;   
+                    STORE ControleProcessamento_NovoRegistro INTO [lib://$(SQLGitLab)/ControleProcessamento_NovoRegistro.qvd] (qvd);
+                    IF ScriptError = 0 THEN
+                        LET RetrySuccess = 1; // Indica sucesso se a gravação foi bem-sucedida
+                        TRACE Arquivo gravado com sucesso na tentativa $(RetryCount).;
+                    ELSE
+                        LET RetryCount = $(RetryCount) + 1;
+                        TRACE Erro ao gravar o arquivo. Código do erro: $(ScriptError). Tentativa $(RetryCount) falhou. Tentando novamente em $(RetryDelay) segundos...;        
+                        Sleep $(RetryDelay) * 1000;
+                    ENDIF
+                LOOP WHILE $(RetrySuccess) = 0 AND $(RetryCount) < $(MaxRetries)
+
+                IF $(RetrySuccess) = 0 THEN
+                    TRACE Não foi possível gravar o arquivo após $(MaxRetries) tentativas. Verifique o sistema.;
+                    TRACE Lista de erros registrados: $(ScriptErrorList);
+                    EXIT SCRIPT;
+                ENDIF
+                SET ErrorMode = 1;
+                DROP TABLE ControleProcessamento_NovoRegistro;
+                
+                ControleProcessamento:
+                LOAD * FROM [lib://$(SQLGitLab)/ControleProcessamento_Menor.qvd](QVD);
+                Concatenate(ControleProcessamento)
+                LOAD * FROM [lib://$(SQLGitLab)/ControleProcessamento_NovoRegistro.qvd](QVD);
+                Concatenate(ControleProcessamento)
+                LOAD * FROM [lib://$(SQLGitLab)/ControleProcessamento_Maior.qvd](QVD);
+                SET MaxRetries = 10;        // Define o número máximo de tentativas
+                SET RetryCount = 0;         // Inicializa o contador de tentativas
+                SET RetryDelay = 30 * 60;   // Define o intervalo de espera entre tentativas (30 minutos em segundos)
+                SET RetrySuccess = 0;       // Inicializa o status de sucesso como 0
+                SET ErrorMode = 0;          // Configura para evitar a interrupção automática em caso de erro
+
+                DO
+                    TRACE Tentativa $(RetryCount) de $(MaxRetries)...;   
+                    STORE ControleProcessamento INTO [lib://$(SQLGitLab)/ControleProcessamento.qvd] (qvd);
+                    IF ScriptError = 0 THEN
+                        LET RetrySuccess = 1; // Indica sucesso se a gravação foi bem-sucedida
+                        TRACE Arquivo gravado com sucesso na tentativa $(RetryCount).;
+                    ELSE
+                        LET RetryCount = $(RetryCount) + 1;
+                        TRACE Erro ao gravar o arquivo. Código do erro: $(ScriptError). Tentativa $(RetryCount) falhou. Tentando novamente em $(RetryDelay) segundos...;        
+                        Sleep $(RetryDelay) * 1000;
+                    ENDIF
+                LOOP WHILE $(RetrySuccess) = 0 AND $(RetryCount) < $(MaxRetries)
+
+                IF $(RetrySuccess) = 0 THEN
+                    TRACE Não foi possível gravar o arquivo após $(MaxRetries) tentativas. Verifique o sistema.;
+                    TRACE Lista de erros registrados: $(ScriptErrorList);
+                    EXIT SCRIPT;
+                ENDIF
+                SET ErrorMode = 1;
+            
+                Let vInicioETL = Timestamp(Now(), 'DD/MM/YYYY hh:mm:ss');
+
+                Disconnect;
+                LIB CONNECT TO '$(vConexao_SQL)';
+                
+				set StripComments=0;
+                TabelaTemporaria:
+                LOAD
+                    @1 AS Line
+                FROM [$(vCaminhoCompleto_SQL)]
+                (txt, utf8, no labels, delimiter is '\t', msq);
+
+                LET vFileContents = '';
+                FOR k = 0 TO NoOfRows('TabelaTemporaria') - 1
+                    LET vFileContents = '$(vFileContents)' & Chr(10) & Peek('Line', $(k), 'TabelaTemporaria');
+                NEXT;
+
+                $(vArquivo_Normalizado):
+                SQL 
+                $(vFileContents);
+
+                LET vNumeroLinhas = NoOfRows('$(vArquivo_Normalizado)');
+				set StripComments=1;
+                
+                SET MaxRetries = 10;        // Define o número máximo de tentativas
+                SET RetryCount = 0;         // Inicializa o contador de tentativas
+                SET RetryDelay = 30 * 60;   // Define o intervalo de espera entre tentativas (30 minutos em segundos)
+                SET RetrySuccess = 0;       // Inicializa o status de sucesso como 0
+                SET ErrorMode = 0;          // Configura para evitar a interrupção automática em caso de erro
+
+                DO
+                    TRACE Tentativa $(RetryCount) de $(MaxRetries)...;   
+                    STORE $(vArquivo_Normalizado) INTO [lib://$(ETL)/$(vPasta_DataBase_SQL)/$(vPasta_SQL)/$(vArquivo_Normalizado).qvd] (qvd);
+                	STORE $(vArquivo_Normalizado) INTO [lib://$(ETLDesktop)/$(vPasta_SQL)/$(vArquivo_Normalizado).qvd] (qvd);
+                    IF ScriptError = 0 THEN
+                        LET RetrySuccess = 1; // Indica sucesso se a gravação foi bem-sucedida
+                        TRACE Arquivo gravado com sucesso na tentativa $(RetryCount).;
+                    ELSE
+                        LET RetryCount = $(RetryCount) + 1;
+                        TRACE Erro ao gravar o arquivo. Código do erro: $(ScriptError). Tentativa $(RetryCount) falhou. Tentando novamente em $(RetryDelay) segundos...;        
+                        Sleep $(RetryDelay) * 1000;
+                    ENDIF
+                LOOP WHILE $(RetrySuccess) = 0 AND $(RetryCount) < $(MaxRetries)
+
+                IF $(RetrySuccess) = 0 THEN
+                    TRACE Não foi possível gravar o arquivo após $(MaxRetries) tentativas. Verifique o sistema.;
+                    TRACE Lista de erros registrados: $(ScriptErrorList);
+                    EXIT SCRIPT;
+                ENDIF
+                SET ErrorMode = 1;
+
+                DROP TABLE $(vArquivo_Normalizado);
+                DROP TABLE TabelaTemporaria;
+
+                Let vFimETL = Timestamp(Now(), 'DD/MM/YYYY hh:mm:ss');
+                Let vTotalETL = Interval(Timestamp#('$(vFimETL)', 'DD/MM/YYYY hh:mm:ss') - Timestamp#('$(vInicioETL)', 'DD/MM/YYYY hh:mm:ss'), 'hh:mm:ss');
+
+                DROP TABLE ControleProcessamento;
+                ControleProcessamento_Menor:
+                LOAD
+                  Arquivo_Normalizado,
+                  Pasta_Raiz_SQL,
+                  Pasta_SQL,
+                  ID_Prioridade,
+                  Pasta_DataBase_SQL,
+                  Conexao_SQL,
+                  Servidor_Responsavel,
+                  Arquivo_SQL,
+                  CaminhoCompleto_SQL,
+                  TotalArquivoPasta_SQL,
+                  TotalArquivos_SQL,
+                  Size_QVD,
+                  Server,
+                  Status_Arquivo,
+                  Status_Pasta,
+                  InicioCarga,
+                  InicioETL,
+                  FimETL,
+                  TotalETL,
+                  NumeroLinhas,
+                  FimCarga,
+                  TotalCarga
+                FROM [lib://$(SQLGitLab)/ControleProcessamento.qvd] (qvd) WHERE ID_Prioridade < '$(vID_Prioridade)';
+                SET MaxRetries = 10;        // Define o número máximo de tentativas
+                SET RetryCount = 0;         // Inicializa o contador de tentativas
+                SET RetryDelay = 30 * 60;   // Define o intervalo de espera entre tentativas (30 minutos em segundos)
+                SET RetrySuccess = 0;       // Inicializa o status de sucesso como 0
+                SET ErrorMode = 0;          // Configura para evitar a interrupção automática em caso de erro
+
+                DO
+                    TRACE Tentativa $(RetryCount) de $(MaxRetries)...;   
+                    STORE ControleProcessamento_Menor INTO [lib://$(SQLGitLab)/ControleProcessamento_Menor.qvd] (qvd);
+                    IF ScriptError = 0 THEN
+                        LET RetrySuccess = 1; // Indica sucesso se a gravação foi bem-sucedida
+                        TRACE Arquivo gravado com sucesso na tentativa $(RetryCount).;
+                    ELSE
+                        LET RetryCount = $(RetryCount) + 1;
+                        TRACE Erro ao gravar o arquivo. Código do erro: $(ScriptError). Tentativa $(RetryCount) falhou. Tentando novamente em $(RetryDelay) segundos...;        
+                        Sleep $(RetryDelay) * 1000;
+                    ENDIF
+                LOOP WHILE $(RetrySuccess) = 0 AND $(RetryCount) < $(MaxRetries)
+
+                IF $(RetrySuccess) = 0 THEN
+                    TRACE Não foi possível gravar o arquivo após $(MaxRetries) tentativas. Verifique o sistema.;
+                    TRACE Lista de erros registrados: $(ScriptErrorList);
+                    EXIT SCRIPT;
+                ENDIF
+                SET ErrorMode = 1;
+                DROP TABLE ControleProcessamento_Menor;
+                
+                ControleProcessamento_Maior:
+                LOAD
+                  Arquivo_Normalizado,
+                  Pasta_Raiz_SQL,
+                  Pasta_SQL,
+                  ID_Prioridade,
+                  Pasta_DataBase_SQL,
+                  Conexao_SQL,
+                  Servidor_Responsavel,
+                  Arquivo_SQL,
+                  CaminhoCompleto_SQL,
+                  TotalArquivoPasta_SQL,
+                  TotalArquivos_SQL,
+                  Size_QVD,
+                  Server,
+                  Status_Arquivo,
+                  Status_Pasta,
+                  InicioCarga,
+                  InicioETL,
+                  FimETL,
+                  TotalETL,
+                  NumeroLinhas,
+                  FimCarga,
+                  TotalCarga
+                FROM [lib://$(SQLGitLab)/ControleProcessamento.qvd] (qvd) WHERE ID_Prioridade > '$(vID_Prioridade)';
+                SET MaxRetries = 10;        // Define o número máximo de tentativas
+                SET RetryCount = 0;         // Inicializa o contador de tentativas
+                SET RetryDelay = 30 * 60;   // Define o intervalo de espera entre tentativas (30 minutos em segundos)
+                SET RetrySuccess = 0;       // Inicializa o status de sucesso como 0
+                SET ErrorMode = 0;          // Configura para evitar a interrupção automática em caso de erro
+
+                DO
+                    TRACE Tentativa $(RetryCount) de $(MaxRetries)...;   
+                    STORE ControleProcessamento_Maior INTO [lib://$(SQLGitLab)/ControleProcessamento_Maior.qvd] (qvd);
+                    IF ScriptError = 0 THEN
+                        LET RetrySuccess = 1; // Indica sucesso se a gravação foi bem-sucedida
+                        TRACE Arquivo gravado com sucesso na tentativa $(RetryCount).;
+                    ELSE
+                        LET RetryCount = $(RetryCount) + 1;
+                        TRACE Erro ao gravar o arquivo. Código do erro: $(ScriptError). Tentativa $(RetryCount) falhou. Tentando novamente em $(RetryDelay) segundos...;        
+                        Sleep $(RetryDelay) * 1000;
+                    ENDIF
+                LOOP WHILE $(RetrySuccess) = 0 AND $(RetryCount) < $(MaxRetries)
+
+                IF $(RetrySuccess) = 0 THEN
+                    TRACE Não foi possível gravar o arquivo após $(MaxRetries) tentativas. Verifique o sistema.;
+                    TRACE Lista de erros registrados: $(ScriptErrorList);
+                    EXIT SCRIPT;
+                ENDIF
+                SET ErrorMode = 1;
+				DROP TABLE ControleProcessamento_Maior;
+                
+				ControleProcessamento_NovoRegistro:
+                LOAD
+                    '$(vArquivo_Normalizado)' AS Arquivo_Normalizado,
+                    '$(vPasta_Raiz_SQL)'      AS Pasta_Raiz_SQL,
+                    '$(vPasta_SQL)'           AS Pasta_SQL,
+                    '$(vID_Prioridade)'       AS ID_Prioridade,
+                    '$(vPasta_DataBase_SQL)'  AS Pasta_DataBase_SQL,
+                    '$(vConexao_SQL)' 		  AS Conexao_SQL,
+                    '$(vServidor_Responsavel)' AS Servidor_Responsavel,
+                    '$(vArquivo_SQL)'         AS Arquivo_SQL,
+                    '$(vCaminhoCompleto_SQL)' AS CaminhoCompleto_SQL,
+                    '$(vTotalArquivoPasta_SQL)' AS TotalArquivoPasta_SQL,
+                    '$(vTotalArquivos_SQL)'   AS TotalArquivos_SQL,
+                    '$(vSize_QVD)'   		  AS Size_QVD,
+                    '$(vServer)'              AS Server,
+                    'Concluido'	              AS Status_Arquivo,
+                    'Em_Andamento'            AS Status_Pasta,
+                    '$(vInicioCarga)'         AS InicioCarga,
+                    '$(vInicioETL)'        	  AS InicioETL,
+                    '$(vFimETL)'              AS FimETL,
+                    '$(vTotalETL)'            AS TotalETL,
+                    '$(vNumeroLinhas)'        AS NumeroLinhas,
+                    '0' 					  AS FimCarga,
+      				'0' 					  AS TotalCarga   
+                AUTOGENERATE 1;
+                SET MaxRetries = 10;        // Define o número máximo de tentativas
+                SET RetryCount = 0;         // Inicializa o contador de tentativas
+                SET RetryDelay = 30 * 60;   // Define o intervalo de espera entre tentativas (30 minutos em segundos)
+                SET RetrySuccess = 0;       // Inicializa o status de sucesso como 0
+                SET ErrorMode = 0;          // Configura para evitar a interrupção automática em caso de erro
+
+                DO
+                    TRACE Tentativa $(RetryCount) de $(MaxRetries)...;   
+                    STORE ControleProcessamento_NovoRegistro INTO [lib://$(SQLGitLab)/ControleProcessamento_NovoRegistro.qvd] (qvd);
+                    IF ScriptError = 0 THEN
+                        LET RetrySuccess = 1; // Indica sucesso se a gravação foi bem-sucedida
+                        TRACE Arquivo gravado com sucesso na tentativa $(RetryCount).;
+                    ELSE
+                        LET RetryCount = $(RetryCount) + 1;
+                        TRACE Erro ao gravar o arquivo. Código do erro: $(ScriptError). Tentativa $(RetryCount) falhou. Tentando novamente em $(RetryDelay) segundos...;        
+                        Sleep $(RetryDelay) * 1000;
+                    ENDIF
+                LOOP WHILE $(RetrySuccess) = 0 AND $(RetryCount) < $(MaxRetries)
+
+                IF $(RetrySuccess) = 0 THEN
+                    TRACE Não foi possível gravar o arquivo após $(MaxRetries) tentativas. Verifique o sistema.;
+                    TRACE Lista de erros registrados: $(ScriptErrorList);
+                    EXIT SCRIPT;
+                ENDIF
+                SET ErrorMode = 1;
+                DROP TABLE ControleProcessamento_NovoRegistro;
+                
+                ControleProcessamento:
+                LOAD * FROM [lib://$(SQLGitLab)/ControleProcessamento_Menor.qvd](QVD);
+                Concatenate(ControleProcessamento)
+                LOAD * FROM [lib://$(SQLGitLab)/ControleProcessamento_NovoRegistro.qvd](QVD);
+                Concatenate(ControleProcessamento)
+                LOAD * FROM [lib://$(SQLGitLab)/ControleProcessamento_Maior.qvd](QVD);
+                SET MaxRetries = 10;        // Define o número máximo de tentativas
+                SET RetryCount = 0;         // Inicializa o contador de tentativas
+                SET RetryDelay = 30 * 60;   // Define o intervalo de espera entre tentativas (30 minutos em segundos)
+                SET RetrySuccess = 0;       // Inicializa o status de sucesso como 0
+                SET ErrorMode = 0;          // Configura para evitar a interrupção automática em caso de erro
+
+                DO
+                    TRACE Tentativa $(RetryCount) de $(MaxRetries)...;   
+                    STORE ControleProcessamento INTO [lib://$(SQLGitLab)/ControleProcessamento.qvd] (qvd);
+                    IF ScriptError = 0 THEN
+                        LET RetrySuccess = 1; // Indica sucesso se a gravação foi bem-sucedida
+                        TRACE Arquivo gravado com sucesso na tentativa $(RetryCount).;
+                    ELSE
+                        LET RetryCount = $(RetryCount) + 1;
+                        TRACE Erro ao gravar o arquivo. Código do erro: $(ScriptError). Tentativa $(RetryCount) falhou. Tentando novamente em $(RetryDelay) segundos...;        
+                        Sleep $(RetryDelay) * 1000;
+                    ENDIF
+                LOOP WHILE $(RetrySuccess) = 0 AND $(RetryCount) < $(MaxRetries)
+
+                IF $(RetrySuccess) = 0 THEN
+                    TRACE Não foi possível gravar o arquivo após $(MaxRetries) tentativas. Verifique o sistema.;
+                    TRACE Lista de erros registrados: $(ScriptErrorList);
+                    EXIT SCRIPT;
+                ENDIF
+                SET ErrorMode = 1;
+			ENDIF
+        ENDIF 
+    ENDIF
+NEXT
+IF '$(vServer)' = 'PAINEIS' THEN 
+    Let vFimCarga = Timestamp(Now(), 'DD/MM/YYYY hh:mm:ss');
+    Let vTotalCarga = Interval(Timestamp#('$(vFimCarga)', 'DD/MM/YYYY hh:mm:ss') - Timestamp#('$(vInicioCarga)', 'DD/MM/YYYY hh:mm:ss'), 'hh:mm:ss');
+    
+    SET MaxRetries = 300;        // Define o número máximo de tentativas
+    SET RetryCount = 0;         // Inicializa o contador de tentativas
+    SET RetryDelay = 30 * 60;   // Define o intervalo de espera entre tentativas (30 minutos em segundos)
+    SET RetrySuccess = 0;       // Inicializa o status de sucesso como 0
+    SET ErrorMode = 0;          // Configura para evitar a interrupção automática em caso de erro
+    DO
+        TRACE Tentativa $(RetryCount) de $(MaxRetries)...;   
+
+        LET vAllCompleted = 1; // Assume inicialmente que todos estão concluídos
+        FOR i = 0 TO $(vTotalArquivos_SQL) - 1
+            DROP TABLE ControleProcessamento;
+            ControleProcessamento:
+            LOAD * FROM [lib://SQLGitLab/ControleProcessamento.qvd](qvd);
+
+            LET vID_PrioridadeFinal = Peek('ID_Prioridade', $(i), 'ControleProcessamento');
+            LET vArquivo_NormalizadoFinal = Peek('Arquivo_Normalizado', $(i), 'ControleProcessamento');
+            LET vStatus_ArquivoFinal = Peek('Status_Arquivo', $(i), 'ControleProcessamento');
+            LET vStatus_PastaFinal = Peek('Status_Pasta', $(i), 'ControleProcessamento');
+
+            IF '$(vStatus_ArquivoFinal)' <> 'Concluido' OR '$(vStatus_PastaFinal)' <> 'Em_Andamento' THEN
+                LET vAllCompleted = 0; // Identificado que a condição não é satisfeita
+                EXIT FOR;
+            ENDIF 
+        NEXT
+
+        // Atualização do controle do loop
+        IF vAllCompleted = 1 THEN
+            LET RetrySuccess = 1; // Condição atendida, sair do loop
+            TRACE Todos os arquivos foram processados com sucesso na tentativa $(RetryCount).;
+        ELSE
+            LET RetryCount = $(RetryCount) + 1;
+            TRACE Arquivos pendentes. Tentativa $(RetryCount) falhou. Tentando novamente em $(RetryDelay) segundos...;
+            Sleep $(RetryDelay) * 1000;
+        ENDIF
+
+    LOOP WHILE $(RetrySuccess) = 0 AND $(RetryCount) < $(MaxRetries)
+
+    // Se não conseguir processar os arquivos após todas as tentativas
+    IF $(RetrySuccess) = 0 THEN
+        TRACE Não foi possível processar todos os arquivos após $(MaxRetries) tentativas. Verifique o sistema.;
+        EXIT SCRIPT;
+    ENDIF
+
+    SET ErrorMode = 1;
+
+    DROP TABLE ControleProcessamento;
+    ControleProcessamento:
+        LOAD
+          Arquivo_Normalizado,
+          Pasta_Raiz_SQL,
+          Pasta_SQL,
+          ID_Prioridade,
+          Pasta_DataBase_SQL,
+          Conexao_SQL,
+          Servidor_Responsavel,
+          Arquivo_SQL,
+          CaminhoCompleto_SQL,
+          TotalArquivoPasta_SQL,
+          TotalArquivos_SQL,
+          Size_QVD,
+          Server,
+          Status_Arquivo,
+          IF(Status_Pasta = 'Em_Andamento', 'Concluido', Status_Pasta) AS Status_Pasta,
+          InicioCarga,
+          InicioETL,
+          FimETL,
+          TotalETL,
+          NumeroLinhas,
+          '$(vFimCarga)' AS FimCarga, 
+          '$(vTotalCarga)' AS TotalCarga 
+    FROM [lib://$(SQLGitLab)/ControleProcessamento.qvd] (qvd);
+    STORE ControleProcessamento INTO [lib://$(SQLGitLab)/ControleProcessamento.qvd] (qvd);
+    DROP TABLE ControleProcessamento; 
+ENDIF
