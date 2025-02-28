@@ -1,0 +1,128 @@
+Let vInicioCarga = Timestamp(Now(), 'DD/MM/YYYY hh:mm:ss');
+
+IF (FileSize('lib://$(SQLGitLab)/ControleProcessamento.qvd') > 0) THEN
+    // Carrega os dados existentes
+    ControleProcessamento:
+    LOAD
+      Arquivo_Normalizado,
+      Pasta_Raiz_SQL,
+      Pasta_SQL,
+      ID_Prioridade,
+      Pasta_DataBase_SQL,
+      Conexao_SQL,
+      Servidor_Responsavel,
+      Arquivo_SQL,
+      CaminhoCompleto_SQL,
+      TotalArquivoPasta_SQL,
+      TotalArquivos_SQL,
+      Size_QVD,
+      Server,
+      Status_Arquivo,
+      Status_Pasta,
+      InicioCarga,
+      InicioETL,
+      FimETL,
+      TotalETL,
+      NumeroLinhas,
+      FimCarga,
+      TotalCarga
+    FROM [lib://SQLGitLab/ControleProcessamento.qvd](qvd);
+    
+    LET vAllCompleted = 1;
+    FOR i = 0 TO NoOfRows('ControleProcessamento') - 1
+        LET vStatus_ArquivoFinal = Peek('Status_Arquivo', $(i), 'ControleProcessamento');
+        LET vStatus_PastaFinal = Peek('Status_Pasta', $(i), 'ControleProcessamento');
+        
+        IF '$(vStatus_ArquivoFinal)' <> 'Concluido' OR '$(vStatus_PastaFinal)' <> 'Concluido' THEN
+            LET vAllCompleted = 0;
+            EXIT FOR;
+        ENDIF 
+    NEXT
+
+    IF $(vAllCompleted) = 1 THEN
+        TRACE Todos os arquivos foram processados. Criando nova carga....;
+        DROP TABLE ControleProcessamento;
+        ControleProcessamento:
+        LOAD
+            Arquivo_Normalizado,
+            Pasta_Raiz_SQL,
+            Pasta_SQL,
+            ID_Prioridade,
+            Pasta_DataBase_SQL,
+            Conexao_SQL,
+            Servidor_Responsavel,
+            Arquivo_SQL,
+            CaminhoCompleto_SQL,
+            TotalArquivoPasta_SQL,
+            TotalArquivos_SQL,
+            Size_QVD,
+            'Nao_Iniciado' AS Server,
+            'Nao_Iniciado' AS Status_Arquivo,
+            'Nao_Iniciado' AS Status_Pasta,
+            '$(vInicioCarga)' AS InicioCarga,
+            ''  AS InicioETL,
+            ''  AS FimETL,
+            ''  AS TotalETL,
+            ''  AS NumeroLinhas,
+            ''  AS FimCarga,
+            ''  AS TotalCarga
+        Resident PrioridadeSQL;
+    ELSE
+        TRACE Ainda há arquivos em processamento.;
+    ENDIF
+ELSE
+    TRACE Arquivo não encontrado. Criando nova tabela...;
+    ControleProcessamento:
+    LOAD
+      Arquivo_Normalizado,
+      Pasta_Raiz_SQL,
+      Pasta_SQL,
+      ID_Prioridade,
+      Pasta_DataBase_SQL,
+      Conexao_SQL,
+      Servidor_Responsavel,
+      Arquivo_SQL,
+      CaminhoCompleto_SQL,
+      TotalArquivoPasta_SQL,
+      TotalArquivos_SQL,
+      Size_QVD,
+      'Nao_Iniciado' AS Server,
+      'Nao_Iniciado' AS Status_Arquivo,
+      'Nao_Iniciado' AS Status_Pasta,
+      '$(vInicioCarga)' AS InicioCarga,
+      ''  AS InicioETL,
+      ''  AS FimETL,
+      ''  AS TotalETL,
+      ''  AS NumeroLinhas,
+      ''  AS FimCarga,
+      ''  AS TotalCarga
+    Resident PrioridadeSQL;
+ENDIF
+
+// Processo de salvamento e tentativas de gravação
+SET MaxRetries = 10;        
+SET RetryCount = 0;         
+SET RetryDelay = 30 * 60;   
+SET RetrySuccess = 0;       
+SET ErrorMode = 0;          
+
+DO
+    TRACE Tentativa $(RetryCount) de $(MaxRetries)...;   
+    STORE ControleProcessamento INTO [lib://$(SQLGitLab)/ControleProcessamento.qvd] (qvd);
+    IF ScriptError = 0 THEN
+        LET RetrySuccess = 1;
+        TRACE Arquivo gravado com sucesso na tentativa $(RetryCount).;
+    ELSE
+        LET RetryCount = $(RetryCount) + 1;
+        TRACE Erro ao gravar o arquivo. Código do erro: $(ScriptError). Tentativa $(RetryCount) falhou. Tentando novamente em $(RetryDelay) segundos...;        
+        Sleep $(RetryDelay) * 1000;
+    ENDIF
+LOOP WHILE $(RetrySuccess) = 0 AND $(RetryCount) < $(MaxRetries)
+
+IF $(RetrySuccess) = 0 THEN
+    TRACE Não foi possível gravar o arquivo após $(MaxRetries) tentativas. Verifique o sistema.;
+    TRACE Lista de erros registrados: $(ScriptErrorList);
+    EXIT SCRIPT;
+ENDIF
+SET ErrorMode = 1;
+DROP TABLE PrioridadeSQL;
