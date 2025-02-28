@@ -1,0 +1,89 @@
+SUB RecursiveFileSearch(vPastaAtual)
+    FOR EACH vFile IN FileList('$(vPastaAtual)/*.sql')
+        ListaSQL:
+        LOAD
+            RowNo() AS ID_SQL,
+            SubField('$(vFile)', '/', 3) AS Pasta_Raiz_SQL, 
+            SubField('$(vFile)', '/', 4) AS Pasta_DataBase_SQL,              
+            IF(
+                WildMatch(SubField('$(vFile)', '/', 4), '*-oracle*'),'ORACLE - REPLICA',
+                IF(
+                    WildMatch(SubField('$(vFile)', '/', 4), '*-mongodb*'),'MongoDB - PROD',
+                    IF(
+                        WildMatch(SubField('$(vFile)', '/', 4), '*-sqlserver*'),'SQL Server - PROD',
+                        IF(
+                            WildMatch(SubField('$(vFile)', '/', 4), '*-mysql*') AND SubField('$(vFile)', '/', 5) = 'extract_dgap_mysql','MySQL - SGP PROD',
+                            IF(
+                                WildMatch(SubField('$(vFile)', '/', 4), '*-mysql*') AND SubField('$(vFile)', '/', 5) = 'extract_maria_penha_mysql','MySQL - MARIAPENHA PROD',
+                                IF(
+                                    WildMatch(SubField('$(vFile)', '/', 4), '*-postgresql*') AND SubField('$(vFile)', '/', 5) = 'extract_ccdpm_postgresql','PostgreSQL - PMGO PROD',
+                                    IF(
+                                        WildMatch(SubField('$(vFile)', '/', 4), '*-postgresql*') AND SubField('$(vFile)', '/', 5) = 'extract_redmine_postgresql','PostgreSQL - REDMINE PROD',
+                                        'CONEXÃO INVALIDA'
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            ) AS Conexao_SQL,
+            IF(
+                WildMatch(SubField('$(vFile)', '/', 4), '*-mongodb*'), 'PAINEIS', // Se for MongoDB, sempre PAINEIS
+                IF(Mod(RowNo(),2) = 0, 'ESTATISTICA', 'PAINEIS') 
+            ) AS Servidor_Responsavel,
+            SubField('$(vFile)', '/', 5) AS Pasta_SQL,
+            SubField('$(vFile)', '/', 6) AS Arquivo_SQL,
+            Replace(SubField('$(vFile)', '/', 6), '.sql', '') AS Arquivo_Normalizado,
+            '$(vFile)' AS CaminhoCompleto_SQL
+        AUTOGENERATE 1;
+        LET vTotalLinhas = NoOfRows('ListaSQL');
+    NEXT
+    
+    FOR EACH vFile IN FileList('$(vPastaAtual)/*.qvd')
+    LET vFileSize = FileSize('$(vFile)');
+        ListaQVD:
+        LOAD
+            Replace(SubField('$(vFile)', '/', 6), '.qvd', '') AS Arquivo_Normalizado,
+            $(vFileSize) AS Size_QVD
+        AUTOGENERATE 1;
+        LET vTotalLinhas = NoOfRows('ListaQVD');
+    NEXT
+    
+
+    FOR EACH vSubPasta IN DirList('$(vPastaAtual)/*')
+        IF NOT WildMatch(vSubPasta, '*extract_diversos_ofc*') THEN
+            CALL RecursiveFileSearch('$(vSubPasta)'); 
+        ENDIF
+    NEXT
+END SUB
+
+CALL RecursiveFileSearch('lib://$(SQLGitLab)');
+CALL RecursiveFileSearch('lib://$(ETL)');
+
+TotalPasta_SQL:
+INNER JOIN (ListaSQL)
+LOAD DISTINCT
+Pasta_SQL,
+COUNT(ID_SQL) AS TotalArquivoPasta_SQL
+RESIDENT ListaSQL GROUP BY Pasta_SQL;
+
+TotalArquivos_SQL:
+INNER JOIN (ListaSQL)
+LOAD DISTINCT
+Pasta_Raiz_SQL,
+COUNT(ID_SQL) AS TotalArquivos_SQL
+RESIDENT ListaSQL GROUP BY Pasta_Raiz_SQL;
+
+ListaQVD:
+INNER JOIN (ListaSQL)
+LOAD DISTINCT * RESIDENT ListaQVD;
+DROP TABLE ListaQVD;
+
+PrioridadeSQL:
+LOAD 
+  RowNo() AS ID_Prioridade,
+  *
+RESIDENT ListaSQL ORDER BY Size_QVD DESC;
+DROP TABLE ListaSQL;
+
+//STORE ListaSQL INTO [lib://$(SQLGitLab)/ListaArquivos.qvd] (qvd);
